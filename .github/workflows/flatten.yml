@@ -2,7 +2,14 @@
 # Needs no secrets: the source is pulled anonymously, the destination (GHCR, your own namespace)
 # is written with the workflow's GITHUB_TOKEN. The source repository is never written to.
 name: flatten-verify-publish
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_digest:
+        description: Existing candidate digest to verify without flattening again (leave empty to flatten source)
+        required: false
+        type: string
+        default: sha256:d3ad10d5d6f1812c15100dc3711419d304c693b910a8b73104171712c942bc7e
 permissions:
   contents: read
   packages: write
@@ -46,8 +53,16 @@ jobs:
       # Source is a digest, so crane pushes the result BY DIGEST into the destination repo
       # given by -t (the tag part is replaced by the digest). No tag exists yet.
       - name: Flatten into an untagged candidate in the destination repo
+        env:
+          EXISTING_DIGEST: ${{ inputs.candidate_digest }}
         run: |
-          FLAT_REF=$(crane flatten "$SOURCE_REPO@$SOURCE_DIGEST" -t "$DEST_REPO:$DEST_TAG" | tail -n1)
+          if [ -n "$EXISTING_DIGEST" ]; then
+            [[ "$EXISTING_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::Invalid candidate digest'; exit 1; }
+            FLAT_REF="$DEST_REPO@$EXISTING_DIGEST"
+            crane manifest "$FLAT_REF" | jq -e '.layers | length == 1' >/dev/null
+          else
+            FLAT_REF=$(crane flatten "$SOURCE_REPO@$SOURCE_DIGEST" -t "$DEST_REPO:$DEST_TAG" | tail -n1)
+          fi
           case "$FLAT_REF" in "$DEST_REPO@sha256:"*) ;; *) echo "::error::unexpected output: $FLAT_REF"; exit 1;; esac
           echo "candidate: $FLAT_REF"
           echo "FLAT_REF=$FLAT_REF" >> "$GITHUB_ENV"
@@ -72,18 +87,25 @@ jobs:
           probe() {
             docker run --rm --network none --hostname image-check --entrypoint /bin/sh "$1" -c '
               id; pwd; umask
-              env | LC_ALL=C sort | sha256sum
-              find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o -printf "%p %y %m %U %G %l\n" 2>/dev/null | LC_ALL=C sort | sha256sum
-              find / -xdev \( -path /proc -o -path /sys -o -path /dev \) -prune -o -print | wc -l'
+              env | LC_ALL=C sort | sha256sum' > "$2-context.txt"
+            # Sort on the runner AFTER find exits. Sorting inside the container
+            # creates random /tmp/sort* files that can enter the listing itself.
+            docker run --rm --network none --hostname image-check --entrypoint /bin/sh "$1" -c '
+              find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o -printf "%p %y %m %U %G %l\n" 2>/dev/null' > "$2-raw.txt"
+            LC_ALL=C sort "$2-raw.txt" > "$2-metadata.txt"
+            cat "$2-context.txt"
+            sha256sum < "$2-metadata.txt"
+            wc -l < "$2-metadata.txt"
           }
           docker pull "$FLAT_REF" >/dev/null
           test "$(docker image inspect -f '{{len .RootFS.Layers}}' "$FLAT_REF")" = 1
-          probe "$FLAT_REF" > probe_flat.txt
+          probe "$FLAT_REF" flat > probe_flat.txt
           docker rmi -f "$FLAT_REF" >/dev/null
           docker pull "$SOURCE_REPO@$SOURCE_DIGEST" >/dev/null
-          probe "$SOURCE_REPO@$SOURCE_DIGEST" > probe_src.txt
+          probe "$SOURCE_REPO@$SOURCE_DIGEST" source > probe_src.txt
           docker rmi -f "$SOURCE_REPO@$SOURCE_DIGEST" >/dev/null
           cat probe_flat.txt
+          diff -u source-metadata.txt flat-metadata.txt
           diff probe_src.txt probe_flat.txt && echo "runtime probe identical"
 
       # Reached only if every earlier step succeeded.
