@@ -1,0 +1,95 @@
+# Save as .github/workflows/flatten.yml. Put compare.py at the repo root (test_compare.py optional).
+# Needs no secrets: the source is pulled anonymously, the destination (GHCR, your own namespace)
+# is written with the workflow's GITHUB_TOKEN. The source repository is never written to.
+name: flatten-verify-publish
+on: workflow_dispatch
+permissions:
+  contents: read
+  packages: write
+env:
+  SOURCE_REPO: ls250824/run-comfyui-minimax          # read-only
+  SOURCE_DIGEST: sha256:04fd72af7de670543ba28224ee06ff10e8facd114b4abd93997431b4b9873b33
+  DEST_NAME: run-comfyui-minimax                     # becomes ghcr.io/<your-account>/<DEST_NAME>
+  DEST_TAG: 30092026-flat
+  CRANE_VERSION: v0.22.1
+jobs:
+  flatten:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262          # v4.4.0
+      - uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523 # main, pinned
+      - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b      # v0.7
+        with:
+          version: ${{ env.CRANE_VERSION }}
+
+      - name: Unit-test the verifier (synthetic layers)
+        run: python3 test_compare.py
+
+      - name: Resolve destination and log in (GHCR, GITHUB_TOKEN)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "DEST_REPO=ghcr.io/${OWNER}/${DEST_NAME}" >> "$GITHUB_ENV"
+          echo "$GH_TOKEN" | crane auth login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Preflight (single-image source; refuse to overwrite an existing tag)
+        run: |
+          crane manifest "$SOURCE_REPO@$SOURCE_DIGEST" | jq -e 'has("layers")' >/dev/null
+          echo "source layers: $(crane manifest "$SOURCE_REPO@$SOURCE_DIGEST" | jq '.layers|length')"
+          if crane digest "$DEST_REPO:$DEST_TAG" >/dev/null 2>&1; then
+            echo "::error::$DEST_REPO:$DEST_TAG already exists; refusing to overwrite"; exit 1
+          fi
+
+      # Source is a digest, so crane pushes the result BY DIGEST into the destination repo
+      # given by -t (the tag part is replaced by the digest). No tag exists yet.
+      - name: Flatten into an untagged candidate in the destination repo
+        run: |
+          FLAT_REF=$(crane flatten "$SOURCE_REPO@$SOURCE_DIGEST" -t "$DEST_REPO:$DEST_TAG" | tail -n1)
+          case "$FLAT_REF" in "$DEST_REPO@sha256:"*) ;; *) echo "::error::unexpected output: $FLAT_REF"; exit 1;; esac
+          echo "candidate: $FLAT_REF"
+          echo "FLAT_REF=$FLAT_REF" >> "$GITHUB_ENV"
+
+      - name: Verify filesystem, config and rootfs structure
+        run: python3 compare.py --src-ref "$SOURCE_REPO@$SOURCE_DIGEST" --flat-ref "$FLAT_REF" --summary summary.json
+
+      - name: Disk check before Docker unpacks anything
+        run: |
+          NEED=$(jq '(.flat_bytes + .src_compressed_bytes + 4294967296)' summary.json)
+          AVAIL=$(df --output=avail -B1 /var/lib/docker | tail -n1 | tr -d ' ')
+          echo "need >= $NEED bytes, available $AVAIL"
+          [ "$AVAIL" -ge "$NEED" ] || { echo "::error::not enough disk for the CPU smoke test"; exit 1; }
+
+      # CPU-only smoke test. --network none and a shell entrypoint mean the start script, model
+      # downloads and provisioning never run. It proves: Docker can pull and unpack the image, the
+      # container rootfs mounts, the image's USER/WORKDIR apply, and a full metadata listing of the
+      # runtime filesystem (path/type/mode/uid/gid/symlink target, no contents, no env values) is
+      # identical for source and candidate. It does NOT test the start script, GPU/CUDA, or Sysbox.
+      - name: CPU smoke test, candidate then source (one at a time to save disk)
+        run: |
+          probe() {
+            docker run --rm --network none --hostname image-check --entrypoint /bin/sh "$1" -c '
+              id; pwd; umask
+              env | LC_ALL=C sort | sha256sum
+              find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o -printf "%p %y %m %U %G %l\n" 2>/dev/null | LC_ALL=C sort | sha256sum
+              find / -xdev \( -path /proc -o -path /sys -o -path /dev \) -prune -o -print | wc -l'
+          }
+          docker pull "$FLAT_REF" >/dev/null
+          test "$(docker image inspect -f '{{len .RootFS.Layers}}' "$FLAT_REF")" = 1
+          probe "$FLAT_REF" > probe_flat.txt
+          docker rmi -f "$FLAT_REF" >/dev/null
+          docker pull "$SOURCE_REPO@$SOURCE_DIGEST" >/dev/null
+          probe "$SOURCE_REPO@$SOURCE_DIGEST" > probe_src.txt
+          docker rmi -f "$SOURCE_REPO@$SOURCE_DIGEST" >/dev/null
+          cat probe_flat.txt
+          diff probe_src.txt probe_flat.txt && echo "runtime probe identical"
+
+      # Reached only if every earlier step succeeded.
+      - name: Publish tag
+        run: |
+          crane tag "$FLAT_REF" "$DEST_TAG"
+          echo "published $DEST_REPO:$DEST_TAG -> $(crane digest "$DEST_REPO:$DEST_TAG")"
+          echo "Verified: filesystem/config/rootfs equivalence + CPU smoke test only. GPU and Lium/Sysbox are untested."
+          echo "New GHCR packages are private: set the package to Public in GitHub (Packages > package settings) or give Lium a pull credential."
