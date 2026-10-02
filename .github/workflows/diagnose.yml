@@ -1,0 +1,45 @@
+name: diagnose-runtime-difference
+on: workflow_dispatch
+permissions:
+  contents: read
+  packages: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: jlumbroso/free-disk-space@36e9a5af4eddb91fc11aec4c6f6f79b3cc0cb523
+      - name: Authenticate to existing candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Compare full runtime metadata without starting provisioning
+        env:
+          SOURCE: ls250824/run-comfyui-minimax@sha256:04fd72af7de670543ba28224ee06ff10e8facd114b4abd93997431b4b9873b33
+          FLAT: ghcr.io/anthonyvanderpoel93-sys/run-comfyui-minimax@sha256:d3ad10d5d6f1812c15100dc3711419d304c693b910a8b73104171712c942bc7e
+        run: |
+          set -euo pipefail
+          probe() {
+            docker pull "$1" >/dev/null
+            docker image inspect "$1" --format '{{json .Config}}' > "$2-config.json"
+            docker run --rm --network none --hostname image-check --entrypoint /bin/sh "$1" -c '
+              find / -xdev \( -path /proc -o -path /sys -o -path /dev -o -path /etc/hosts -o -path /etc/hostname -o -path /etc/resolv.conf \) -prune -o -printf "%p %y %m %U %G %l\n" 2>/dev/null | LC_ALL=C sort' > "$2-metadata.txt"
+            docker run --rm --network none --hostname image-check --entrypoint /bin/sh "$1" -c '
+              id; pwd; umask
+              env | LC_ALL=C sort | sha256sum
+              stat -c "%n %F %a %u %g" / /workspace /tmp /etc
+              cat /proc/mounts | grep -E " / | /workspace "' > "$2-context.txt"
+            docker rmi -f "$1" >/dev/null
+          }
+          probe "$FLAT" flat
+          probe "$SOURCE" source
+          echo '=== Runtime metadata differences ==='
+          diff -u source-metadata.txt flat-metadata.txt > metadata.diff || result=$?
+          cat metadata.diff
+          echo '=== Flat runtime context ==='
+          cat flat-context.txt
+          echo '=== Source runtime context ==='
+          cat source-context.txt
+          echo '=== Config differences ==='
+          diff -u <(jq -S . source-config.json) <(jq -S . flat-config.json)
+          echo "Metadata diff exit: ${result:-0}"
